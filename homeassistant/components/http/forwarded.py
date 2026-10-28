@@ -10,6 +10,8 @@ from hass_nabucasa import remote
 
 from homeassistant.core import callback
 
+from .const import is_proxy_unix_socket_request
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -85,34 +87,39 @@ def async_setup_forwarded(
             # No forwarding headers, continue as normal
             return await handler(request)
 
-        # Get connected IP
-        if (
-            request.transport is None
-            or request.transport.get_extra_info("peername") is None
-        ):
-            # Connected IP isn't retrieveable from the request transport, continue
-            return await handler(request)
+        # The proxy plugin's socket is only reachable by the plugin, which
+        # sets the forwarded headers itself; there is no peer IP to check.
+        if not is_proxy_unix_socket_request(request):
+            # Get connected IP
+            if (
+                request.transport is None
+                or request.transport.get_extra_info("peername") is None
+            ):
+                # Connected IP isn't retrieveable from the request transport, continue
+                return await handler(request)
 
-        connected_ip = ip_address(request.transport.get_extra_info("peername")[0])
+            connected_ip = ip_address(request.transport.get_extra_info("peername")[0])
 
-        # We have X-Forwarded-For, but config does not agree
-        if not use_x_forwarded_for:
-            _LOGGER.error(
-                (
-                    "A request from a reverse proxy was received from %s, but your "
-                    "HTTP integration is not set-up for reverse proxies"
-                ),
-                connected_ip,
-            )
-            raise HTTPBadRequest
+            # We have X-Forwarded-For, but config does not agree
+            if not use_x_forwarded_for:
+                _LOGGER.error(
+                    (
+                        "A request from a reverse proxy was received from %s, but "
+                        "your HTTP integration is not set-up for reverse proxies"
+                    ),
+                    connected_ip,
+                )
+                raise HTTPBadRequest
 
-        # Ensure the IP of the connected peer is trusted
-        if not any(connected_ip in trusted_proxy for trusted_proxy in trusted_proxies):
-            _LOGGER.error(
-                "Received X-Forwarded-For header from an untrusted proxy %s",
-                connected_ip,
-            )
-            raise HTTPBadRequest
+            # Ensure the IP of the connected peer is trusted
+            if not any(
+                connected_ip in trusted_proxy for trusted_proxy in trusted_proxies
+            ):
+                _LOGGER.error(
+                    "Received X-Forwarded-For header from an untrusted proxy %s",
+                    connected_ip,
+                )
+                raise HTTPBadRequest
 
         # Process multiple X-Forwarded-For from the right side (by reversing the list)
         forwarded_for_split = list(

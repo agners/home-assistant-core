@@ -23,7 +23,9 @@ from homeassistant.util.ssl import SSLProfile
 
 from .const import (
     CONF_BASE_URL,
+    CONF_CERTIFICATE,
     CONF_CORS_ORIGINS,
+    CONF_HTTPS_PORT,
     CONF_IP_BAN_ENABLED,
     CONF_LOGIN_ATTEMPTS_THRESHOLD,
     CONF_SERVER_HOST,
@@ -36,6 +38,7 @@ from .const import (
     CONF_USE_X_FORWARDED_FOR,
     CONF_USE_X_FRAME_OPTIONS,
     DEFAULT_CORS,
+    DEFAULT_HTTPS_PORT,
     DEFAULT_SSL_PROFILE,
     DOMAIN,
     ENV_SETUP_PORT,
@@ -43,6 +46,7 @@ from .const import (
     NO_LOGIN_ATTEMPT_THRESHOLD,
     SUPERVISOR_DEFAULT_PORT,
     UNVERSIONED_SSL_PROFILES,
+    CertificateSource,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,7 +77,7 @@ def default_server_port() -> int:
 
 STORAGE_KEY: Final = DOMAIN
 STORAGE_VERSION: Final = 3
-STORAGE_MINOR_VERSION: Final = 1
+STORAGE_MINOR_VERSION: Final = 2
 
 KEY_STABLE: Final = "stable"
 KEY_PENDING: Final = "pending"
@@ -109,6 +113,8 @@ class ConfData(TypedDict, total=False):
     ip_ban_enabled: bool
     ssl_profile: SSLProfile
     use_x_frame_options: bool
+    https_port: int
+    certificate: CertificateSource
     created_at: str
     error: str | None
     error_message: str | None
@@ -165,6 +171,10 @@ HTTP_STORAGE_SCHEMA: Final = probatio.Schema(
             CONF_SSL_PROFILE, default=DEFAULT_SSL_PROFILE
         ): probatio.Coerce(SSLProfile),
         probatio.Optional(CONF_USE_X_FRAME_OPTIONS, default=True): cv.boolean,
+        # Only used with the proxy plugin, which serves HTTP and HTTPS side by
+        # side; without it the single listener is on server_port.
+        probatio.Optional(CONF_HTTPS_PORT, default=DEFAULT_HTTPS_PORT): probatio.Port(),
+        probatio.Optional(CONF_CERTIFICATE): probatio.Coerce(CertificateSource),
     }
 )
 _DEFAULT_CONFIG: Final[ConfData] = ConfData(
@@ -384,6 +394,10 @@ class HTTPConfigStore:
                 for config in (raw[KEY_STABLE], raw[KEY_PENDING]):
                     if config is not None:
                         config[CONF_SSL_PROFILE] = SSLProfile(config[CONF_SSL_PROFILE])
+                        if CONF_CERTIFICATE in config:
+                            config[CONF_CERTIFICATE] = CertificateSource(
+                                config[CONF_CERTIFICATE]
+                            )
                 self._stable = raw[KEY_STABLE]
                 self._pending = raw[KEY_PENDING]
                 self._yaml_migration_done = raw[KEY_YAML_MIGRATION_DONE]
@@ -726,4 +740,9 @@ class _HTTPStore(Store[_HTTPStoreData]):
             _migrate_ssl_profile(old_data[KEY_STABLE])
             if old_data[KEY_PENDING] is not None:
                 _migrate_ssl_profile(old_data[KEY_PENDING])
+        if (old_major_version, old_minor_version) < (3, 2):
+            # 3.2 added the HTTPS port for the proxy plugin
+            old_data[KEY_STABLE].setdefault(CONF_HTTPS_PORT, DEFAULT_HTTPS_PORT)
+            if old_data[KEY_PENDING] is not None:
+                old_data[KEY_PENDING].setdefault(CONF_HTTPS_PORT, DEFAULT_HTTPS_PORT)
         return old_data

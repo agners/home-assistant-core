@@ -30,7 +30,7 @@ from homeassistant.helpers.hassio import get_supervisor_ip, is_hassio
 from homeassistant.helpers.http import KEY_HASS, HomeAssistantView
 from homeassistant.util import dt as dt_util, yaml as yaml_util
 
-from .const import is_supervisor_unix_socket_request
+from .const import is_proxy_unix_socket_request, is_supervisor_unix_socket_request
 
 _LOGGER: Final = logging.getLogger(__name__)
 
@@ -75,6 +75,10 @@ async def ban_middleware(
     """IP Ban middleware."""
     # Unix socket connections are trusted, skip ban checks
     if is_supervisor_unix_socket_request(request):
+        return await handler(request)
+
+    # A proxy request without forwarded client address has no IP to ban
+    if not request.remote and is_proxy_unix_socket_request(request):
         return await handler(request)
 
     if (ban_manager := request.app.get(KEY_BAN_MANAGER)) is None:

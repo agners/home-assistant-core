@@ -12,7 +12,7 @@ from pathlib import Path
 import socket
 import ssl
 from tempfile import NamedTemporaryFile
-from typing import Any, Final, cast, override
+from typing import TYPE_CHECKING, Any, Final, cast, override
 
 from aiohttp import web
 from aiohttp.abc import AbstractStreamWriter
@@ -44,8 +44,10 @@ from homeassistant.util.ssl import SSLProfile
 
 from .auth import async_setup_auth
 from .ban import setup_bans
+from .certificates import CertificatePair
 from .config import _DEFAULT_CONFIG, ConfData, _strip_meta
 from .const import (
+    CONF_HTTPS_PORT,
     CONF_SERVER_HOST,
     CONF_SERVER_PORT,
     CONF_SSL_CERTIFICATE,
@@ -53,12 +55,21 @@ from .const import (
     CONF_SSL_PEER_CERTIFICATE,
     CONF_SSL_PROFILE,
     CONF_TRUSTED_PROXIES,
+    DEFAULT_HTTPS_PORT,
     ENV_SUPERVISOR,
     is_supervisor_unix_socket_request,
 )
 from .cors import setup_cors
 from .forwarded import async_setup_forwarded
 from .headers import setup_headers
+from .proxy import (
+    LOAD_ATTEMPTS,
+    LOAD_RETRY_DELAY,
+    CaddyAdminClient,
+    ProxyPaths,
+    ProxyUnavailableError,
+    render_caddy_config,
+)
 from .request_context import setup_request_context
 from .security_filter import setup_security_filter
 from .static import CACHE_HEADERS, CachingStaticResource
@@ -105,12 +116,22 @@ def make_server(
     hass: HomeAssistant,
     conf: ConfData,
     supervisor_unix_socket_path: Path | None = None,
+    proxy: ProxyPaths | None = None,
+    certificate: CertificatePair | None = None,
 ) -> HomeAssistantHTTP:
-    """Create a server instance for the given config."""
+    """Create a server instance for the given config.
+
+    ``certificate`` is the resolved PEM pair for the uploaded and generated
+    certificate sources (and for file paths when fronted by the proxy); the
+    file paths in ``conf`` are used directly otherwise.
+    """
     return HomeAssistantHTTP(
         hass,
         server_host=conf.get(CONF_SERVER_HOST, DEFAULT_BIND),
         server_port=conf[CONF_SERVER_PORT],
+        https_port=conf.get(CONF_HTTPS_PORT, DEFAULT_HTTPS_PORT),
+        certificate=certificate,
+        proxy=proxy,
         ssl_certificate=conf.get(CONF_SSL_CERTIFICATE),
         ssl_peer_certificate=conf.get(CONF_SSL_PEER_CERTIFICATE),
         ssl_key=conf.get(CONF_SSL_KEY),
@@ -271,6 +292,9 @@ class HomeAssistantHTTP:
         ssl_profile: SSLProfile,
         supervisor_unix_socket_path: Path | None = None,
         port_transition: bool = False,
+        https_port: int = DEFAULT_HTTPS_PORT,
+        certificate: CertificatePair | None = None,
+        proxy: ProxyPaths | None = None,
     ) -> None:
         """Initialize the HTTP Home Assistant server."""
         self.app = HomeAssistantApplication(
@@ -290,8 +314,16 @@ class HomeAssistantHTTP:
         self.trusted_proxies = trusted_proxies
         self.ssl_profile = ssl_profile
         self.supervisor_unix_socket_path = supervisor_unix_socket_path
+        self.https_port = https_port
+        self.certificate = certificate
+        self.proxy = proxy
+        # Set once the proxy plugin accepted the config; the server then
+        # listens on the proxy socket only. Stays False when the plugin is
+        # unreachable and Core serves directly instead.
+        self.proxy_active = False
         self.runner: web.AppRunner | None = None
         self.supervisor_site: HomeAssistantUnixSite | None = None
+        self.proxy_site: HomeAssistantUnixSite | None = None
         self.context: ssl.SSLContext | None = None
         self._server: asyncio.Server | None = None
         # Redirect the previous default port to the active one, bound to
@@ -301,19 +333,64 @@ class HomeAssistantHTTP:
         self._legacy_redirect_runner: web.AppRunner | None = None
         self._legacy_redirect_server: asyncio.Server | None = None
 
+    @property
+    def proxy_unix_socket_path(self) -> Path | None:
+        """Return the socket the proxy plugin forwards to, if serving through it."""
+        if self.proxy is None or not self.proxy_active:
+            return None
+        return self.proxy.core_socket
+
     async def async_bind(self) -> None:
         """Create the SSL context and the server, binding its sockets.
 
         Called during setup so that an unusable configuration surfaces before
         it is applied; serving starts later in ``start()``. Raises
-        ``HomeAssistantError`` if the SSL configuration is unusable and
-        ``OSError`` if the configured address cannot be bound.
+        ``HomeAssistantError`` if the SSL configuration is unusable or the
+        proxy plugin rejects it, and ``OSError`` if the configured address
+        cannot be bound.
+
+        With the proxy plugin the listeners are the proxy's: the config is
+        pushed to it here and Core only opens the socket the proxy forwards
+        to. When the proxy cannot be reached Core serves directly instead,
+        so it stays reachable with a broken plugin.
         """
-        if self.ssl_certificate:
+        if self.proxy is not None:
+            await self._async_push_proxy_config()
+            if self.proxy_active:
+                return
+        if self.ssl_certificate or self.certificate is not None:
             self.context = await self.hass.async_add_executor_job(
                 self._create_ssl_context
             )
         self._server = await self._async_create_server()
+
+    async def _async_push_proxy_config(self) -> None:
+        """Push the listener config to the proxy plugin, retrying while it starts."""
+        if TYPE_CHECKING:
+            assert self.proxy is not None
+        config = render_caddy_config(
+            hosts=self.server_host,
+            http_port=self.server_port,
+            https_port=self.https_port,
+            certificate=self.certificate,
+            trusted_proxies=[str(proxy) for proxy in self.trusted_proxies],
+        )
+        client = CaddyAdminClient(self.proxy.admin_socket)
+        last_error: ProxyUnavailableError | None = None
+        for attempt in range(1, LOAD_ATTEMPTS + 1):
+            try:
+                await client.async_load(config)
+            except ProxyUnavailableError as err:
+                last_error = err
+                if attempt < LOAD_ATTEMPTS:
+                    await asyncio.sleep(LOAD_RETRY_DELAY)
+                continue
+            self.proxy_active = True
+            return
+        _LOGGER.error(
+            "The proxy plugin is not reachable, serving directly instead: %s",
+            last_error,
+        )
 
     async def _async_create_server(self) -> asyncio.Server:
         """Create the (not yet serving) HTTP server, binding its sockets."""
@@ -463,12 +540,26 @@ class HomeAssistantHTTP:
                 )
             )
 
+    def _load_cert_chain(self, context: ssl.SSLContext) -> None:
+        """Load the configured certificate into the context."""
+        if self.certificate is None:
+            if TYPE_CHECKING:
+                assert self.ssl_certificate is not None
+            context.load_cert_chain(self.ssl_certificate, self.ssl_key)
+            return
+        # load_cert_chain only takes paths
+        with NamedTemporaryFile() as cert_pem, NamedTemporaryFile() as key_pem:
+            cert_pem.write(self.certificate["certificate"].encode())
+            key_pem.write(self.certificate["key"].encode())
+            cert_pem.flush()
+            key_pem.flush()
+            context.load_cert_chain(cert_pem.name, key_pem.name)
+
     def _create_ssl_context(self) -> ssl.SSLContext | None:
         context: ssl.SSLContext | None = None
-        assert self.ssl_certificate is not None
         try:
             context = ssl_util.server_context(self.ssl_profile)
-            context.load_cert_chain(self.ssl_certificate, self.ssl_key)
+            self._load_cert_chain(context)
         except OSError as error:
             if not self.hass.config.recovery_mode:
                 raise HomeAssistantError(
@@ -566,6 +657,27 @@ class HomeAssistantHTTP:
             context.load_cert_chain(cert_pem.name, key_pem.name)
         return context
 
+    async def _async_start_proxy_site(self) -> None:
+        """Listen on the socket the proxy plugin forwards to."""
+        if TYPE_CHECKING:
+            assert self.proxy is not None and self.runner is not None
+        self.proxy_site = HomeAssistantUnixSite(self.runner, self.proxy.core_socket)
+        try:
+            await self.proxy_site.start()
+        except OSError as error:
+            self.proxy_site = None
+            _LOGGER.error(
+                "Failed to listen for the proxy plugin on %s: %s",
+                self.proxy.core_socket,
+                error,
+            )
+            return
+        _LOGGER.info(
+            "Now serving through the proxy plugin on port %d (HTTPS on port %s)",
+            self.server_port,
+            self.https_port if self.certificate is not None else "-",
+        )
+
     async def async_start_supervisor_unix_socket(self) -> None:
         """Start listening on the Unix socket.
 
@@ -606,12 +718,14 @@ class HomeAssistantHTTP:
         )
         await self.runner.setup()
 
-        # Setup either binds the server or fails, so it is always available
-        # here.
-        assert self._server is not None
-        await self._server.start_serving()
-
-        _LOGGER.info("Now listening on port %d", self.server_port)
+        if self.proxy_active:
+            await self._async_start_proxy_site()
+        else:
+            # Setup either binds the server or fails, so it is always
+            # available here.
+            assert self._server is not None
+            await self._server.start_serving()
+            _LOGGER.info("Now listening on port %d", self.server_port)
 
         if self._port_transition:
             # Defer to onboarding setup so async_is_onboarded and
@@ -696,6 +810,20 @@ class HomeAssistantHTTP:
     async def stop(self) -> None:
         """Stop the aiohttp server."""
         await self._async_stop_legacy_redirect()
+        if self.proxy_site is not None:
+            await self.proxy_site.stop()
+            if TYPE_CHECKING:
+                assert self.proxy is not None
+            try:
+                await self.hass.async_add_executor_job(
+                    self.proxy.core_socket.unlink, True
+                )
+            except OSError as err:
+                _LOGGER.warning(
+                    "Could not remove proxy unix socket %s: %s",
+                    self.proxy.core_socket,
+                    err,
+                )
         if self.supervisor_site is not None:
             await self.supervisor_site.stop()
             if self.supervisor_unix_socket_path is not None:

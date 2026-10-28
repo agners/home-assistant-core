@@ -1,5 +1,6 @@
 """HTTP specific constants."""
 
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 from aiohttp.web import Request
@@ -16,6 +17,7 @@ DOMAIN: Final = "http"
 KEY_HASS_USER: Final = "hass_user"
 KEY_HASS_REFRESH_TOKEN_ID: Final = "hass_refresh_token_id"
 KEY_SUPERVISOR_UNIX_SOCKET: Final = "ha_supervisor_unix_socket"
+KEY_PROXY_UNIX_SOCKET: Final = "ha_proxy_unix_socket"
 
 # System user used to authenticate requests over the Supervisor Unix socket.
 # Set by the hassio integration during its setup; the Unix socket is only
@@ -35,6 +37,22 @@ CONF_TRUSTED_PROXIES: Final = "trusted_proxies"
 CONF_LOGIN_ATTEMPTS_THRESHOLD: Final = "login_attempts_threshold"
 CONF_IP_BAN_ENABLED: Final = "ip_ban_enabled"
 CONF_SSL_PROFILE: Final = "ssl_profile"
+CONF_HTTPS_PORT: Final = "https_port"
+CONF_CERTIFICATE: Final = "certificate"
+
+DEFAULT_HTTPS_PORT: Final = 443
+
+
+class CertificateSource(StrEnum):
+    """Where the server certificate for HTTPS comes from."""
+
+    # The ssl_certificate/ssl_key file paths
+    FILES = "files"
+    # A certificate and key uploaded through the UI
+    UPLOADED = "uploaded"
+    # A certificate issued by the locally generated certificate authority
+    GENERATED = "generated"
+
 
 # Profile names of the deprecated YAML config and of storage before version
 # 3. They predate the versioned profiles and name the v4 ones.
@@ -53,6 +71,10 @@ ISSUE_SSL_PROFILE_OUTDATED: Final = "ssl_profile_outdated"
 
 ENV_SETUP_PORT: Final = "SETUP_PORT"
 ENV_SUPERVISOR: Final = "SUPERVISOR"
+# Set by Supervisor while its proxy plugin is enabled: the plugin's admin
+# socket and the socket Core listens on for the plugin.
+ENV_PROXY_SOCKET: Final = "SUPERVISOR_PROXY_SOCKET"
+ENV_PROXY_CORE_SOCKET: Final = "SUPERVISOR_PROXY_CORE_SOCKET"
 
 # Default HTTP port when running under Supervisor, which fronts Core on the
 # standard HTTP port.
@@ -66,6 +88,29 @@ NO_LOGIN_ATTEMPT_THRESHOLD: Final = -1
 MAX_UNAUTHENTICATED_BODY_SIZE: Final = 64 * 1024
 
 ATTR_CONFIG = "config"
+
+
+def is_proxy_unix_socket_request(request: Request) -> bool:
+    """Check if request arrived over the proxy plugin's Unix socket.
+
+    Such requests carry the forwarded headers set by the proxy; the socket is
+    the trust anchor, not a peer IP address.
+    """
+    cached: bool | None = request.get(KEY_PROXY_UNIX_SOCKET)
+    if cached is not None:
+        return cached
+    if (
+        (hass := request.app.get(KEY_HASS)) is None
+        or (http := hass.http) is None
+        or (proxy_path := http.proxy_unix_socket_path) is None
+        or (transport := request.transport) is None
+    ):
+        result = False
+    else:
+        sockname: str | None = transport.get_extra_info("sockname")
+        result = sockname == str(proxy_path)
+    request[KEY_PROXY_UNIX_SOCKET] = result
+    return result
 
 
 def is_supervisor_unix_socket_request(request: Request) -> bool:

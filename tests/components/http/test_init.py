@@ -31,6 +31,7 @@ from homeassistant.auth.providers.homeassistant import HassAuthProvider
 from homeassistant.components import cloud, http, onboarding
 from homeassistant.components.cloud import CloudNotAvailable
 from homeassistant.components.http import DOMAIN
+from homeassistant.components.http.certificates import async_get_certificate_store
 from homeassistant.components.http.config import (
     _DEFAULT_CONFIG,
     AUTO_REVERT_DELAY,
@@ -45,6 +46,11 @@ from homeassistant.components.http.const import (
     DATA_SUPERVISOR_USER,
     ENV_SETUP_PORT,
     ENV_SUPERVISOR,
+)
+from homeassistant.components.http.proxy import (
+    LOAD_ATTEMPTS,
+    ProxyConfigError,
+    ProxyUnavailableError,
 )
 from homeassistant.components.http.repairs import (
     SSLProfileOutdatedFlow,
@@ -1256,7 +1262,11 @@ async def test_yaml_migration_matches_stable_no_pending(
     stored = hass_storage[DOMAIN]["data"]
     assert stored["pending"] is None
     # Without a certificate the unversioned profile moves to the current one.
-    assert stored["stable"] == {**stored_stable, "ssl_profile": "intermediate_v6"}
+    assert stored["stable"] == {
+        **stored_stable,
+        "ssl_profile": "intermediate_v6",
+        "https_port": 443,
+    }
 
     issue = issue_registry.async_get_issue(DOMAIN, "deprecated_yaml")
     assert issue is not None
@@ -1376,7 +1386,11 @@ async def test_yaml_migration_differs_from_stable_creates_pending(
 
     stored = hass_storage[DOMAIN]["data"]
     # Without a certificate the unversioned profile moves to the current one.
-    assert stored["stable"] == {**stored_stable, "ssl_profile": "intermediate_v6"}
+    assert stored["stable"] == {
+        **stored_stable,
+        "ssl_profile": "intermediate_v6",
+        "https_port": 443,
+    }
     assert stored["pending"] == {
         "server_port": 8765,
         "cors_allowed_origins": ["https://cast.home-assistant.io"],
@@ -1384,6 +1398,7 @@ async def test_yaml_migration_differs_from_stable_creates_pending(
         "ip_ban_enabled": False,
         "ssl_profile": "intermediate_v6",
         "use_x_frame_options": True,
+        "https_port": 443,
         "created_at": dt_util.utcnow().isoformat(),
         "error": None,
         "error_message": None,
@@ -1604,7 +1619,7 @@ async def test_setup_migrates_v1_storage_to_v2(
     # staged.
     assert hass.config.api.port == 9876
     assert hass_storage[DOMAIN]["version"] == 3
-    assert hass_storage[DOMAIN]["minor_version"] == 1
+    assert hass_storage[DOMAIN]["minor_version"] == 2
     data = hass_storage[DOMAIN]["data"]
     # The v1→v2 migration normalises the payload through the storage schema,
     # so the v2 stable slot is well-formed (all keys present) on disk.
@@ -1702,7 +1717,7 @@ async def test_setup_migrates_v2_1_storage_to_v2_2(
         "error_message": None,
     }
     # The migrated payload is written back to disk right away.
-    assert hass_storage[DOMAIN]["minor_version"] == 1
+    assert hass_storage[DOMAIN]["minor_version"] == 2
     assert hass_storage[DOMAIN]["data"] == {
         "stable": _stored_config(
             {"server_port": 9876}, created_at=dt_util.utcnow().isoformat()
@@ -1740,7 +1755,7 @@ async def test_setup_migrates_v2_2_storage_to_v3(
     await hass.async_start()
     await hass.async_block_till_done()
 
-    assert hass_storage[DOMAIN]["minor_version"] == 1
+    assert hass_storage[DOMAIN]["minor_version"] == 2
     assert hass_storage[DOMAIN]["data"] == {
         "stable": _stored_config(
             {**ssl_conf, "ssl_profile": "modern_v4"}, created_at=STABLE_CREATED_AT
@@ -2456,6 +2471,8 @@ async def test_websocket_http_config(
         "revert_at": None,
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
+        "proxy": {"available": False, "active": False},
+        "certificates": {"uploaded": None, "generated": None},
     }
 
     new_config = {
@@ -2467,6 +2484,7 @@ async def test_websocket_http_config(
         "login_attempts_threshold": 5,
         "ssl_profile": "modern_v6",
         "use_x_frame_options": True,
+        "https_port": 443,
     }
     await ws_client.send_json_auto_id(
         {"type": "http/config/configure", "config": new_config}
@@ -2500,6 +2518,8 @@ async def test_websocket_http_config(
         "revert_at": None,
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
+        "proxy": {"available": False, "active": False},
+        "certificates": {"uploaded": None, "generated": None},
     }
 
     # Promote: pending becomes stable, pending is cleared.
@@ -2528,6 +2548,8 @@ async def test_websocket_http_config(
         "revert_at": None,
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
+        "proxy": {"available": False, "active": False},
+        "certificates": {"uploaded": None, "generated": None},
     }
 
     # Promoting again with no pending is rejected.
@@ -3005,6 +3027,8 @@ async def test_pending_config_auto_reverts_to_stable(
         "revert_at": revert_at.isoformat(),
         "active_config_type": "pending",
         "default": _DEFAULT_CONFIG,
+        "proxy": {"available": False, "active": False},
+        "certificates": {"uploaded": None, "generated": None},
     }
 
     # After the delay elapses without a promotion, pending is marked reverted
@@ -3611,6 +3635,8 @@ async def test_pending_config_promote_cancels_revert(
         "revert_at": None,
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
+        "proxy": {"available": False, "active": False},
+        "certificates": {"uploaded": None, "generated": None},
     }
 
     # The cancelled revert must not fire after the delay.
@@ -3694,3 +3720,318 @@ async def test_websocket_configure_without_trusted_proxies(
     )
     response = await ws_client.receive_json()
     assert response["success"]
+
+
+@pytest.fixture
+def proxy_env(tmp_path: Path) -> Iterator[tuple[Path, Path]]:
+    """Point Core at a proxy plugin via its environment."""
+    admin_socket = tmp_path / "proxy.sock"
+    core_socket = tmp_path / "core.sock"
+    with patch.dict(
+        os.environ,
+        {
+            "SUPERVISOR_PROXY_SOCKET": str(admin_socket),
+            "SUPERVISOR_PROXY_CORE_SOCKET": str(core_socket),
+        },
+        clear=False,
+    ):
+        yield admin_socket, core_socket
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_mode_pushes_config_and_serves_on_socket(
+    hass: HomeAssistant,
+) -> None:
+    """Test that with the proxy plugin Core pushes its config and skips the TCP bind."""
+    loop = asyncio.get_running_loop()
+    mock_sock = Mock()
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load"
+        ) as mock_load,
+        patch.object(loop, "create_server") as mock_create_server,
+        patch(
+            "homeassistant.components.http.web_runner.HomeAssistantUnixSite"
+            "._create_unix_socket",
+            return_value=mock_sock,
+        ),
+        patch.object(
+            loop, "create_unix_server", return_value=Mock()
+        ) as mock_create_unix,
+    ):
+        assert await async_setup_component(hass, DOMAIN, {"http": {}})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    mock_load.assert_awaited_once()
+    config = mock_load.call_args.args[0]
+    assert config["apps"]["http"]["servers"]["http"]["listen"] == [
+        f":{hass.http.server_port}"
+    ]
+    assert "https" not in config["apps"]["http"]["servers"]
+    mock_create_server.assert_not_called()
+    mock_create_unix.assert_called_once_with(ANY, sock=mock_sock, backlog=128)
+    assert hass.http.proxy_active is True
+    assert hass.http.proxy_site is not None
+    assert hass.http.proxy_unix_socket_path == hass.http.proxy.core_socket
+    assert hass.config.api.use_ssl is False
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_mode_https_with_generated_certificate(
+    hass: HomeAssistant,
+) -> None:
+    """Test a generated certificate adds the HTTPS listener to the proxy config."""
+    store = await async_get_certificate_store(hass)
+    await store.async_generate(["homeassistant.local"])
+    hass_storage_config = {"certificate": "generated", "https_port": 8443}
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(HTTP_STORAGE_SCHEMA(hass_storage_config))
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load"
+        ) as mock_load,
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    config = mock_load.call_args.args[0]
+    assert config["apps"]["http"]["servers"]["https"]["listen"] == [":8443"]
+    assert (
+        config["apps"]["tls"]["certificates"]["load_pem"][0]["certificate"]
+        == (store.generated["certificate"])
+    )
+    # The API stays on plain HTTP for devices that cannot use TLS
+    assert hass.config.api.use_ssl is False
+    assert hass.config.api.port == hass.http.server_port
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_unavailable_serves_directly(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test Core binds its own port when the proxy plugin cannot be reached."""
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load",
+            side_effect=ProxyUnavailableError("down"),
+        ) as mock_load,
+        patch("homeassistant.components.http.server.LOAD_RETRY_DELAY", 0),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {"http": {}})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    assert mock_load.await_count == LOAD_ATTEMPTS
+    assert hass.http.proxy_active is False
+    assert hass.http.proxy_unix_socket_path is None
+    assert hass.http.proxy_site is None
+    assert "serving directly instead" in caplog.text
+    # The direct listener is up
+    assert hass.http._server is not None
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_rejected_config_falls_back_to_stable(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Test a config the proxy rejects is marked failed and stable is pushed instead."""
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(HTTP_STORAGE_SCHEMA({"server_port": 9999}))
+
+    async def load(config: dict[str, Any]) -> None:
+        if config["apps"]["http"]["servers"]["http"]["listen"] == [":9999"]:
+            raise ProxyConfigError("port in use")
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load",
+            side_effect=load,
+        ) as mock_load,
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    assert mock_load.await_count == 2
+    assert hass.http.proxy_active is True
+    assert hass.http.server_port == _DEFAULT_CONFIG["server_port"]
+    pending = hass_storage[DOMAIN]["data"]["pending"]
+    assert pending["error"] == "apply_failed"
+    assert "port in use" in pending["error_message"]
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_websocket_config_reports_proxy(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Test http/config reports the proxy state and the websocket skips the bind probe."""
+    with (
+        patch("homeassistant.components.http.server.CaddyAdminClient.async_load"),
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+    await ws_client.send_json_auto_id({"type": "http/config"})
+    response = await ws_client.receive_json()
+    assert response["result"]["proxy"] == {"available": True, "active": True}
+
+    async_mock_service(hass, "homeassistant", "restart")
+    with patch(
+        "homeassistant.components.http.websocket_api.async_verify_can_bind"
+    ) as verify_bind:
+        await ws_client.send_json_auto_id(
+            {"type": "http/config/configure", "config": {"server_port": 9999}}
+        )
+        response = await ws_client.receive_json()
+    assert response["success"]
+    verify_bind.assert_not_called()
+
+
+async def test_websocket_https_port_must_differ(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Test the HTTPS port cannot equal the HTTP port."""
+    assert await async_setup_component(hass, DOMAIN, {})
+    await async_setup_component(hass, "websocket_api", {})
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+    await ws_client.send_json_auto_id(
+        {
+            "type": "http/config/configure",
+            "config": {"server_port": 8443, "https_port": 8443},
+        }
+    )
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert "HTTPS port must differ" in response["error"]["message"]
+
+
+async def test_websocket_certificates(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Test uploading, generating, fetching the CA and deleting certificates."""
+    assert await async_setup_component(hass, DOMAIN, {})
+    await async_setup_component(hass, "websocket_api", {})
+    await hass.async_start()
+    await hass.async_block_till_done()
+    ws_client = await hass_ws_client(hass)
+
+    # Nothing generated yet
+    await ws_client.send_json_auto_id({"type": "http/certificate/ca"})
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "not_found"
+
+    # An upload is validated
+    await ws_client.send_json_auto_id(
+        {"type": "http/certificate/upload", "certificate": "nope", "key": "nope"}
+    )
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "invalid_certificate"
+
+    # Selecting the uploaded source without an upload is refused
+    await ws_client.send_json_auto_id(
+        {"type": "http/config/configure", "config": {"certificate": "uploaded"}}
+    )
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "invalid_certificate"
+
+    await ws_client.send_json_auto_id(
+        {"type": "http/certificate/generate", "subjects": ["ha.local", "192.0.2.1"]}
+    )
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"]["subject_alt_names"] == ["ha.local", "192.0.2.1"]
+    assert response["result"]["issuer"] == "CN=Home Assistant Local CA,O=Home Assistant"
+
+    await ws_client.send_json_auto_id({"type": "http/certificate/ca"})
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert response["result"]["certificate"].startswith("-----BEGIN CERTIFICATE-----")
+
+    await ws_client.send_json_auto_id({"type": "http/config"})
+    response = await ws_client.receive_json()
+    assert response["result"]["certificates"]["uploaded"] is None
+    assert response["result"]["certificates"]["generated"]["subject"] == "CN=ha.local"
+
+    # Selecting the generated source and then deleting it is refused
+    async_mock_service(hass, "homeassistant", "restart")
+    await ws_client.send_json_auto_id(
+        {"type": "http/config/configure", "config": {"certificate": "generated"}}
+    )
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert hass_storage[DOMAIN]["data"]["pending"]["certificate"] == "generated"
+
+    await ws_client.send_json_auto_id(
+        {"type": "http/certificate/delete", "source": "generated"}
+    )
+    response = await ws_client.receive_json()
+    assert not response["success"]
+    assert response["error"]["code"] == "certificate_in_use"
+
+    await ws_client.send_json_auto_id({"type": "http/config/configure", "config": None})
+    await ws_client.receive_json()
+    await ws_client.send_json_auto_id(
+        {"type": "http/certificate/delete", "source": "generated"}
+    )
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert hass_storage["http.certificates"]["data"]["generated"] is None
+
+
+async def test_websocket_generate_default_subjects(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Test the default subjects cover the local name, IP and internal URL host."""
+    hass.config.internal_url = "https://ha.example.test:8123"
+    assert await async_setup_component(hass, DOMAIN, {})
+    await async_setup_component(hass, "websocket_api", {})
+    await hass.async_start()
+    await hass.async_block_till_done()
+    hass.config.api.local_ip = "192.0.2.10"
+
+    ws_client = await hass_ws_client(hass)
+    await ws_client.send_json_auto_id({"type": "http/certificate/generate"})
+    response = await ws_client.receive_json()
+    assert response["success"]
+    assert set(response["result"]["subject_alt_names"]) == {
+        "homeassistant.local",
+        "192.0.2.10",
+        "ha.example.test",
+    }
+
+
+async def test_direct_https_with_generated_certificate(
+    hass: HomeAssistant, aiohttp_client: ClientSessionGenerator
+) -> None:
+    """Test the generated certificate is served directly without the proxy plugin."""
+    store = await async_get_certificate_store(hass)
+    await store.async_generate(["homeassistant.local"])
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(
+        HTTP_STORAGE_SCHEMA({"certificate": "generated"})
+    )
+
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    assert hass.http.context is not None
+    assert hass.config.api.use_ssl is True
+    assert hass.http.ssl_certificate is None

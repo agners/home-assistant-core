@@ -28,6 +28,7 @@ from homeassistant.setup import (
 )
 from homeassistant.util.async_ import create_eager_task
 
+from .certificates import async_get_certificate_store
 from .config import ConfData, async_get_and_load_store, async_load_config
 from .const import (
     CONF_BASE_URL,
@@ -47,6 +48,8 @@ from .const import (
     DATA_SUPERVISOR_USER,
     DEFAULT_CORS,
     DOMAIN,
+    ENV_PROXY_CORE_SOCKET,
+    ENV_PROXY_SOCKET,
     ISSUE_SSL_PROFILE_OUTDATED,
     KEY_HASS_REFRESH_TOKEN_ID,
     KEY_HASS_USER,
@@ -55,6 +58,7 @@ from .const import (
     SSL_MODERN,
 )
 from .decorators import require_admin
+from .proxy import ProxyPaths
 from .server import (
     DEFAULT_BIND,
     HassioHTTPConfigView,
@@ -142,6 +146,24 @@ class ApiConfig:
         self.use_ssl = use_ssl
 
 
+def _proxy_paths_from_env() -> ProxyPaths | None:
+    """Return the proxy plugin sockets from the environment, if Supervisor set them."""
+    admin_env = os.environ.get(ENV_PROXY_SOCKET)
+    core_env = os.environ.get(ENV_PROXY_CORE_SOCKET)
+    if not admin_env or not core_env:
+        return None
+    admin_socket = Path(admin_env)
+    core_socket = Path(core_env)
+    if not admin_socket.is_absolute() or not core_socket.is_absolute():
+        _LOGGER.error(
+            "Invalid proxy socket paths %s and %s: paths must be absolute",
+            admin_env,
+            core_env,
+        )
+        return None
+    return ProxyPaths(admin_socket=admin_socket, core_socket=core_socket)
+
+
 @callback
 def _async_update_ssl_profile_issue(hass: HomeAssistant, conf: ConfData) -> None:
     """Offer upgrading a superseded SSL profile the server is running with."""
@@ -193,16 +215,22 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 socket_env,
             )
 
-    server = make_server(hass, conf, supervisor_unix_socket_path)
+    proxy = _proxy_paths_from_env()
+    certificate_store = await async_get_certificate_store(hass)
     trial_reverted = False
     while True:
         try:
+            certificate = await certificate_store.async_resolve(
+                conf, read_files=proxy is not None
+            )
+            server = make_server(
+                hass, conf, supervisor_unix_socket_path, proxy, certificate
+            )
             await server.async_bind()
         except (HomeAssistantError, OSError) as err:
             store = await async_get_and_load_store(hass)
             trial_reverted = store.revert_deadline is not None
             conf = await store.async_get_fallback_config(err)
-            server = make_server(hass, conf, supervisor_unix_socket_path)
             continue
         if trial_reverted:
             _LOGGER.warning(
@@ -269,16 +297,17 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         # Assume the first server host name provided as API host
         host = server_host[0]
 
-    hass.config.api = ApiConfig(
-        local_ip, host, server_port, ssl_certificate is not None
+    # Behind the proxy plugin the API port stays the plain HTTP listener, so
+    # devices that cannot speak TLS keep working; the HTTPS listener is for
+    # browsers and apps.
+    use_ssl = not server.proxy_active and (
+        ssl_certificate is not None or server.certificate is not None
     )
+    hass.config.api = ApiConfig(local_ip, host, server_port, use_ssl)
 
     @callback
     def _async_check_ssl_issue(_: Event) -> None:
-        if (
-            ssl_certificate is not None
-            and (hass.config.external_url or hass.config.internal_url) is None
-        ):
+        if use_ssl and (hass.config.external_url or hass.config.internal_url) is None:
             from homeassistant.components.cloud import (  # noqa: PLC0415
                 CloudNotAvailable,
                 async_remote_ui_url,
