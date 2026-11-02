@@ -21,6 +21,7 @@ from homeassistant.components.http.certificates import (
 from homeassistant.components.http.const import CertificateSource
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import dt as dt_util
 
 
 def _pem(cert: x509.Certificate) -> str:
@@ -38,7 +39,7 @@ def _key_pem(key: ec.EllipticCurvePrivateKey) -> str:
 def _self_signed(name: str) -> tuple[str, str]:
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, name)])
-    now = dt.datetime.now(dt.UTC)
+    now = dt_util.utcnow()
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
