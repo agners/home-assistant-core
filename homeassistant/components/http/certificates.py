@@ -261,6 +261,16 @@ class CertificateStore:
         """Return the generated CA and server certificate."""
         return self._data["generated"]
 
+    def pair(self, source: CertificateSource) -> CertificatePair | None:
+        """Return the stored certificate pair of ``source``, if any."""
+        if source is CertificateSource.UPLOADED:
+            return self._data["uploaded"]
+        if (generated := self._data["generated"]) is None:
+            return None
+        return CertificatePair(
+            certificate=generated["certificate"], key=generated["key"]
+        )
+
     async def async_set_uploaded(self, certificate: str, key: str) -> CertificateInfo:
         """Validate and store an uploaded certificate pair."""
         info = await self._hass.async_add_executor_job(

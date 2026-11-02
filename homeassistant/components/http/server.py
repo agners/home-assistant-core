@@ -47,6 +47,7 @@ from .ban import setup_bans
 from .certificates import CertificatePair
 from .config import _DEFAULT_CONFIG, ConfData, _strip_meta
 from .const import (
+    CONF_CERTIFICATE,
     CONF_HTTPS_PORT,
     CONF_SERVER_HOST,
     CONF_SERVER_PORT,
@@ -57,6 +58,7 @@ from .const import (
     CONF_TRUSTED_PROXIES,
     DEFAULT_HTTPS_PORT,
     ENV_SUPERVISOR,
+    CertificateSource,
     is_supervisor_unix_socket_request,
 )
 from .cors import setup_cors
@@ -131,6 +133,7 @@ def make_server(
         server_port=conf[CONF_SERVER_PORT],
         https_port=conf.get(CONF_HTTPS_PORT, DEFAULT_HTTPS_PORT),
         certificate=certificate,
+        certificate_source=conf.get(CONF_CERTIFICATE, CertificateSource.FILES),
         proxy=proxy,
         ssl_certificate=conf.get(CONF_SSL_CERTIFICATE),
         ssl_peer_certificate=conf.get(CONF_SSL_PEER_CERTIFICATE),
@@ -294,6 +297,7 @@ class HomeAssistantHTTP:
         port_transition: bool = False,
         https_port: int = DEFAULT_HTTPS_PORT,
         certificate: CertificatePair | None = None,
+        certificate_source: CertificateSource = CertificateSource.FILES,
         proxy: ProxyPaths | None = None,
     ) -> None:
         """Initialize the HTTP Home Assistant server."""
@@ -316,6 +320,7 @@ class HomeAssistantHTTP:
         self.supervisor_unix_socket_path = supervisor_unix_socket_path
         self.https_port = https_port
         self.certificate = certificate
+        self.certificate_source = certificate_source
         self.proxy = proxy
         # Set once the proxy plugin accepted the config; the server then
         # listens on the proxy socket only. Stays False when the plugin is
@@ -364,17 +369,43 @@ class HomeAssistantHTTP:
             )
         self._server = await self._async_create_server()
 
-    async def _async_push_proxy_config(self) -> None:
-        """Push the listener config to the proxy plugin, retrying while it starts."""
-        if TYPE_CHECKING:
-            assert self.proxy is not None
-        config = render_caddy_config(
+    def _render_proxy_config(self) -> dict[str, Any]:
+        return render_caddy_config(
             hosts=self.server_host,
             http_port=self.server_port,
             https_port=self.https_port,
             certificate=self.certificate,
             trusted_proxies=[str(proxy) for proxy in self.trusted_proxies],
         )
+
+    async def async_apply_certificate(self, certificate: CertificatePair) -> bool:
+        """Switch to a new certificate, returning whether a restart is avoided.
+
+        Through the proxy plugin the listeners are reloaded live. Serving
+        directly the SSL context is fixed at bind time, so the caller has to
+        restart. Raises ``HomeAssistantError`` when the proxy refuses the
+        certificate or cannot be reached, leaving the previous one in use.
+        """
+        if not self.proxy_active:
+            return False
+        if TYPE_CHECKING:
+            assert self.proxy is not None
+        previous = self.certificate
+        self.certificate = certificate
+        try:
+            await CaddyAdminClient(self.proxy.admin_socket).async_load(
+                self._render_proxy_config()
+            )
+        except HomeAssistantError:
+            self.certificate = previous
+            raise
+        return True
+
+    async def _async_push_proxy_config(self) -> None:
+        """Push the listener config to the proxy plugin, retrying while it starts."""
+        if TYPE_CHECKING:
+            assert self.proxy is not None
+        config = self._render_proxy_config()
         client = CaddyAdminClient(self.proxy.admin_socket)
         last_error: ProxyUnavailableError | None = None
         for attempt in range(1, LOAD_ATTEMPTS + 1):

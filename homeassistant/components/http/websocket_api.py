@@ -32,6 +32,11 @@ ERR_BIND_FAILED: Final = "bind_failed"
 ERR_NOT_RUNNING: Final = "not_running"
 ERR_INVALID_CERTIFICATE: Final = "invalid_certificate"
 ERR_CERTIFICATE_IN_USE: Final = "certificate_in_use"
+ERR_APPLY_FAILED: Final = "apply_failed"
+
+STATUS_APPLIED: Final = "applied"
+STATUS_RESTART_REQUIRED: Final = "restart_required"
+STATUS_NOT_SELECTED: Final = "not_selected"
 
 ATTR_CERTIFICATE: Final = "certificate"
 ATTR_KEY: Final = "key"
@@ -261,7 +266,12 @@ async def websocket_upload_certificate(
     except HomeAssistantError as err:
         connection.send_error(msg["id"], ERR_INVALID_CERTIFICATE, str(err))
         return
-    connection.send_result(msg["id"], info)
+    try:
+        status = await _async_apply_certificate(hass, store, CertificateSource.UPLOADED)
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], ERR_APPLY_FAILED, str(err))
+        return
+    connection.send_result(msg["id"], {**info, "status": status})
 
 
 @websocket_api.require_admin
@@ -285,7 +295,28 @@ async def websocket_generate_certificate(
     except HomeAssistantError as err:
         connection.send_error(msg["id"], ERR_INVALID_CERTIFICATE, str(err))
         return
-    connection.send_result(msg["id"], info)
+    try:
+        status = await _async_apply_certificate(
+            hass, store, CertificateSource.GENERATED
+        )
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], ERR_APPLY_FAILED, str(err))
+        return
+    connection.send_result(msg["id"], {**info, "status": status})
+
+
+async def _async_apply_certificate(
+    hass: HomeAssistant, store: CertificateStore, source: CertificateSource
+) -> str:
+    """Put a new certificate of ``source`` into use if the running server selects it."""
+    http = hass.http
+    if http.certificate_source is not source:
+        return STATUS_NOT_SELECTED
+    if (pair := store.pair(source)) is None:
+        return STATUS_NOT_SELECTED
+    if not await http.async_apply_certificate(pair):
+        return STATUS_RESTART_REQUIRED
+    return STATUS_APPLIED
 
 
 def _default_subjects(hass: HomeAssistant) -> list[str]:

@@ -46,6 +46,7 @@ from homeassistant.components.http.const import (
     DATA_SUPERVISOR_USER,
     ENV_SETUP_PORT,
     ENV_SUPERVISOR,
+    CertificateSource,
 )
 from homeassistant.components.http.proxy import (
     LOAD_ATTEMPTS,
@@ -3807,6 +3808,92 @@ async def test_proxy_mode_https_with_generated_certificate(
     # The API stays on plain HTTP for devices that cannot use TLS
     assert hass.config.api.use_ssl is False
     assert hass.config.api.port == hass.http.server_port
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_mode_regenerate_applies_live(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Test a regenerated certificate is pushed to the proxy without a restart."""
+    store = await async_get_certificate_store(hass)
+    await store.async_generate(["homeassistant.local"])
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(
+        HTTP_STORAGE_SCHEMA({"certificate": "generated", "https_port": 8443})
+    )
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load"
+        ) as mock_load,
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        previous = store.generated["certificate"]
+
+        ws_client = await hass_ws_client(hass)
+        await ws_client.send_json_auto_id(
+            {"type": "http/certificate/generate", "subjects": ["ha.local"]}
+        )
+        response = await ws_client.receive_json()
+
+        assert response["success"]
+        assert response["result"]["status"] == "applied"
+        assert mock_load.await_count == 2
+        pushed = mock_load.call_args.args[0]["apps"]["tls"]["certificates"]
+        assert pushed["load_pem"][0]["certificate"] == store.generated["certificate"]
+        assert pushed["load_pem"][0]["certificate"] != previous
+        assert hass.http.certificate == store.pair(CertificateSource.GENERATED)
+
+        # A rejected certificate keeps the previous one in use
+        mock_load.side_effect = ProxyConfigError("rejected")
+        await ws_client.send_json_auto_id(
+            {"type": "http/certificate/generate", "subjects": ["ha.local"]}
+        )
+        response = await ws_client.receive_json()
+
+    assert not response["success"]
+    assert response["error"]["code"] == "apply_failed"
+    assert hass.http.certificate["certificate"] == pushed["load_pem"][0]["certificate"]
+
+
+@pytest.mark.parametrize(
+    ("stored_config", "expected_status"),
+    [
+        pytest.param(
+            {"certificate": "generated"}, "restart_required", id="direct-selected"
+        ),
+        pytest.param({}, "not_selected", id="not-selected"),
+    ],
+)
+async def test_regenerate_without_proxy(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    stored_config: dict[str, Any],
+    expected_status: str,
+) -> None:
+    """Test regenerating reports when a restart is needed or the source is unused."""
+    store = await async_get_certificate_store(hass)
+    await store.async_generate(["homeassistant.local"])
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(HTTP_STORAGE_SCHEMA(stored_config))
+
+    assert await async_setup_component(hass, DOMAIN, {})
+    await async_setup_component(hass, "websocket_api", {})
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    ws_client = await hass_ws_client(hass)
+    await ws_client.send_json_auto_id(
+        {"type": "http/certificate/generate", "subjects": ["ha.local"]}
+    )
+    response = await ws_client.receive_json()
+
+    assert response["success"]
+    assert response["result"]["status"] == expected_status
 
 
 @pytest.mark.usefixtures("proxy_env")
