@@ -16,7 +16,7 @@ _LOGGER = logging.getLogger(__name__)
 # Paths as the proxy container sees them; both directories are mounted into
 # it by Supervisor. Core's view of the same sockets comes from its environment.
 CADDY_ADMIN_LISTEN: Final = "unix//run/supervisor/proxy/proxy.sock|0600"
-CADDY_UPSTREAM: Final = "unix//run/supervisor/core/core.sock"
+CADDY_UPSTREAM: Final = "unix//run/supervisor/core/plugins/proxy/core.sock"
 # Selects the one certificate Core pushes regardless of the requested name,
 # so HTTPS by IP address works without SNI tricks.
 CERTIFICATE_TAG: Final = "core"
