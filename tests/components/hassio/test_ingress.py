@@ -484,6 +484,51 @@ async def test_ingress_websocket(
     assert aioclient_mock.mock_calls[-1][3][X_FORWARDED_PROTO]
 
 
+@pytest.mark.parametrize(
+    ("headers", "expected_status", "expected_forwarded_for"),
+    [
+        pytest.param(
+            {"X-Forwarded-For": "203.0.113.5"},
+            HTTPStatus.OK,
+            "203.0.113.5",
+            id="forwarded-by-proxy",
+        ),
+        pytest.param({}, HTTPStatus.BAD_REQUEST, None, id="missing-header"),
+    ],
+)
+async def test_ingress_via_proxy_plugin(
+    hassio_noauth_client,
+    aioclient_mock: AiohttpClientMocker,
+    headers: dict[str, str],
+    expected_status: HTTPStatus,
+    expected_forwarded_for: str | None,
+) -> None:
+    """Test the proxy plugin's X-Forwarded-For is passed through unchanged."""
+    aioclient_mock.get("http://127.0.0.1/ingress/lorem/ipsum", text="test")
+
+    with (
+        patch(
+            "homeassistant.components.hassio.ingress.is_proxy_unix_socket_request",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.http.forwarded.is_proxy_unix_socket_request",
+            return_value=True,
+        ),
+    ):
+        resp = await hassio_noauth_client.get(
+            "/api/hassio_ingress/lorem/ipsum", headers=headers
+        )
+
+    assert resp.status == expected_status
+    forwarded_for = (
+        aioclient_mock.mock_calls[-1][3][X_FORWARDED_FOR]
+        if aioclient_mock.mock_calls
+        else None
+    )
+    assert forwarded_for == expected_forwarded_for
+
+
 async def test_ingress_missing_peername(
     hassio_noauth_client,
     aioclient_mock: AiohttpClientMocker,

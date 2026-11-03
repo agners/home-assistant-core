@@ -15,6 +15,7 @@ from multidict import CIMultiDict
 from yarl import URL
 
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http.const import is_proxy_unix_socket_request
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.typing import Undefined
 from homeassistant.util.async_ import create_eager_task
@@ -271,12 +272,18 @@ def _init_header(request: web.Request, token: str) -> CIMultiDict:
 
     # Set X-Forwarded-For
     forward_for = request.headers.get(hdrs.X_FORWARDED_FOR)
-    assert request.transport
-    if (peername := request.transport.get_extra_info("peername")) is None:
-        _LOGGER.error("Can't set forward_for header, missing peername")
-        raise HTTPBadRequest
-
-    headers[hdrs.X_FORWARDED_FOR] = _forwarded_for_header(forward_for, peername[0])
+    if is_proxy_unix_socket_request(request):
+        # The proxy plugin already added the client; its socket has no peer IP
+        if not forward_for:
+            _LOGGER.error("Can't set forward_for header, missing X-Forwarded-For")
+            raise HTTPBadRequest
+        headers[hdrs.X_FORWARDED_FOR] = forward_for
+    else:
+        assert request.transport
+        if (peername := request.transport.get_extra_info("peername")) is None:
+            _LOGGER.error("Can't set forward_for header, missing peername")
+            raise HTTPBadRequest
+        headers[hdrs.X_FORWARDED_FOR] = _forwarded_for_header(forward_for, peername[0])
 
     # Set X-Forwarded-Host
     if not (forward_host := request.headers.get(hdrs.X_FORWARDED_HOST)):
