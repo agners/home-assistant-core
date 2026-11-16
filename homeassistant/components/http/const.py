@@ -75,6 +75,10 @@ ENV_SUPERVISOR: Final = "SUPERVISOR"
 # socket and the socket Core listens on for the plugin.
 ENV_PROXY_SOCKET: Final = "SUPERVISOR_PROXY_SOCKET"
 ENV_PROXY_CORE_SOCKET: Final = "SUPERVISOR_PROXY_CORE_SOCKET"
+# Directories of Core's filesystem that Supervisor mounted at the same path
+# into the plugin, colon separated, so the plugin serves static files from
+# them itself: the frontend package and the user's www folder.
+ENV_PROXY_PATHS: Final = "SUPERVISOR_PROXY_PATHS"
 
 # Default HTTP port when running under Supervisor, which fronts Core on the
 # standard HTTP port.

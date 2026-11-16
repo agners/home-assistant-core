@@ -7,6 +7,7 @@ FROM ${BUILD_FROM}
 
 LABEL \
     io.hass.type="core" \
+    io.hass.frontend="/usr/share/hass_frontend" \
     org.opencontainers.image.authors="The Home Assistant Authors" \
     org.opencontainers.image.description="Open-source home automation platform running on Python 3" \
     org.opencontainers.image.documentation="https://www.home-assistant.io/docs/" \
@@ -54,6 +55,9 @@ RUN \
     uv pip install \
         -e ./homeassistant \
     && python3 -m compileall \
-        homeassistant/homeassistant
+        homeassistant/homeassistant \
+    # Fixed path to the frontend package, mounted into the proxy plugin to
+    # serve the static files; relative so an image mount can follow it
+    && ln -s "$(python3 -c 'import os, hass_frontend; print(os.path.relpath(hass_frontend.where(), "/usr/share"))')" /usr/share/hass_frontend
 
 WORKDIR /config

@@ -49,6 +49,7 @@ from .const import (
     DEFAULT_CORS,
     DOMAIN,
     ENV_PROXY_CORE_SOCKET,
+    ENV_PROXY_PATHS,
     ENV_PROXY_SOCKET,
     ISSUE_SSL_PROFILE_OUTDATED,
     KEY_HASS_REFRESH_TOKEN_ID,
@@ -162,7 +163,15 @@ def _proxy_paths_from_env() -> ProxyPaths | None:
             core_env,
         )
         return None
-    return ProxyPaths(admin_socket=admin_socket, core_socket=core_socket)
+    shared: list[Path] = []
+    for shared_env in filter(None, os.environ.get(ENV_PROXY_PATHS, "").split(":")):
+        if not (shared_path := Path(shared_env)).is_absolute():
+            _LOGGER.error(
+                "Invalid proxy shared path %s: path must be absolute", shared_env
+            )
+            continue
+        shared.append(shared_path)
+    return ProxyPaths(admin_socket=admin_socket, core_socket=core_socket, shared=shared)
 
 
 @callback

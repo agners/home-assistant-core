@@ -1,6 +1,6 @@
 """Control of the Supervisor proxy plugin (Caddy) over its admin socket."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from typing import Any, Final
@@ -10,7 +10,9 @@ import aiohttp
 from homeassistant.exceptions import HomeAssistantError
 
 from .certificates import CertificatePair
+from .headers import REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS
 from .public_certificate import PublicCertificate
+from .static import CACHE_HEADER
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +48,16 @@ class ProxyPaths:
 
     admin_socket: Path
     core_socket: Path
+    # Directories the proxy has mounted at the same path as Core sees them
+    shared: list[Path] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyStaticRoute:
+    """A URL prefix the proxy serves from a directory it has mounted."""
+
+    url_path: str
+    root: str
 
 
 def _listen_addresses(hosts: list[str] | None, port: int) -> list[str]:
@@ -64,6 +76,63 @@ def _listen_addresses(hosts: list[str] | None, port: int) -> list[str]:
     return addresses
 
 
+def _static_routes(
+    static_routes: list[ProxyStaticRoute],
+    cors_origins: list[str],
+    use_x_frame_options: bool,
+) -> list[dict[str, Any]]:
+    """Render the file server routes for the static paths.
+
+    The files ship with Brotli and gzip sidecars, which the file server
+    picks by the client's Accept-Encoding. Configured CORS origins get the
+    allow header the way Core's static resources do.
+    """
+    if not static_routes:
+        return []
+    paths = [f"{route.url_path}/*" for route in static_routes]
+    headers: dict[str, list[str]] = {
+        "Cache-Control": [CACHE_HEADER],
+        str(REFERRER_POLICY): ["no-referrer"],
+        str(X_CONTENT_TYPE_OPTIONS): ["nosniff"],
+    }
+    if use_x_frame_options:
+        headers[str(X_FRAME_OPTIONS)] = ["SAMEORIGIN"]
+    routes: list[dict[str, Any]] = [
+        {
+            "match": [{"path": paths, "header": {"Origin": [origin]}}],
+            "handle": [
+                {
+                    "handler": "headers",
+                    "response": {
+                        "set": {
+                            "Access-Control-Allow-Origin": [origin],
+                            "Vary": ["Origin"],
+                        }
+                    },
+                }
+            ],
+        }
+        for origin in cors_origins
+    ]
+    routes.extend(
+        {
+            "match": [{"path": [f"{route.url_path}/*"]}],
+            "handle": [
+                {"handler": "headers", "response": {"set": headers}},
+                {"handler": "rewrite", "strip_path_prefix": route.url_path},
+                {
+                    "handler": "file_server",
+                    "root": route.root,
+                    "precompressed": {"br": {}, "gzip": {}},
+                    "precompressed_order": ["br", "gzip"],
+                },
+            ],
+        }
+        for route in static_routes
+    )
+    return routes
+
+
 def render_caddy_config(
     *,
     hosts: list[str] | None,
@@ -72,6 +141,9 @@ def render_caddy_config(
     certificate: CertificatePair | None,
     public_certificate: PublicCertificate | None = None,
     trusted_proxies: list[str],
+    static_routes: list[ProxyStaticRoute] | None = None,
+    cors_origins: list[str] | None = None,
+    use_x_frame_options: bool = True,
 ) -> dict[str, Any]:
     """Render the full Caddy JSON config for the proxy plugin.
 
@@ -79,24 +151,29 @@ def render_caddy_config(
     falls back to its default TCP admin endpoint and Core loses control.
 
     Both certificates share the HTTPS listener: the public one is picked by
-    SNI for its name, the local one for everything else.
+    SNI for its name, the local one for everything else. Static routes are
+    served by the proxy's file server ahead of the reverse proxy, with the
+    headers Core would add.
     """
-    route = {
-        "handle": [
-            {
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": CADDY_UPSTREAM}],
-                # A config reload (new certificate, handover) must not cut the
-                # frontend's websockets; Caddy closes them at once by default
-                "stream_close_delay": STREAM_CLOSE_DELAY,
-            }
-        ]
-    }
+    routes = [
+        *_static_routes(static_routes or [], cors_origins or [], use_x_frame_options),
+        {
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": CADDY_UPSTREAM}],
+                    # A config reload (new certificate, handover) must not cut
+                    # the frontend's websockets; Caddy closes them by default
+                    "stream_close_delay": STREAM_CLOSE_DELAY,
+                }
+            ]
+        },
+    ]
 
     def server(port: int) -> dict[str, Any]:
         conf: dict[str, Any] = {
             "listen": _listen_addresses(hosts, port),
-            "routes": [route],
+            "routes": routes,
             # Core owns HTTP and HTTPS explicitly; no redirects, no ACME
             "automatic_https": {"disable": True},
         }

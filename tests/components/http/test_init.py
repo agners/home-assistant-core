@@ -3944,6 +3944,72 @@ async def test_proxy_mode_public_certificate(
         ]
 
 
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_mode_static_offload(
+    hass: HomeAssistant, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test cacheable static paths inside a shared directory move to the proxy."""
+    # The package behind a symlink, as the image exposes the frontend
+    package = tmp_path / "site-packages" / "hass_frontend"
+    (package / "frontend_latest").mkdir(parents=True)
+    (package / "static").mkdir()
+    (package / "sw-modern.js").write_text("x")
+    link = tmp_path / "share" / "hass_frontend"
+    link.parent.mkdir()
+    link.symlink_to(package)
+    www = tmp_path / "config" / "www"
+    www.mkdir(parents=True)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+
+    with (
+        patch.dict(os.environ, {"SUPERVISOR_PROXY_PATHS": f"{link}:{www}"}),
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load"
+        ) as mock_load,
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        assert hass.http.proxy.shared == [link, www]
+        await hass.http.async_register_static_paths(
+            [
+                http.StaticPathConfig(
+                    "/frontend_latest", str(package / "frontend_latest")
+                ),
+                http.StaticPathConfig("/static", str(package / "static")),
+                http.StaticPathConfig(
+                    "/sw-modern.js", str(package / "sw-modern.js"), False
+                ),
+                http.StaticPathConfig("/local", str(www)),
+                http.StaticPathConfig("/elsewhere", str(other)),
+            ]
+        )
+        assert mock_load.await_count == 2
+        # Nothing to offload: no push
+        await hass.http.async_register_static_paths(
+            [http.StaticPathConfig("/more", str(other))]
+        )
+        assert mock_load.await_count == 2
+
+    routes = mock_load.call_args.args[0]["apps"]["http"]["servers"]["http"]["routes"]
+    # The CORS route for the default origin, three directories, the proxy
+    assert [route["handle"][-1]["handler"] for route in routes] == [
+        "headers",
+        "file_server",
+        "file_server",
+        "file_server",
+        "reverse_proxy",
+    ]
+    assert [route["handle"][-1]["root"] for route in routes[1:4]] == [
+        str(link / "frontend_latest"),
+        str(link / "static"),
+        str(www),
+    ]
+    assert "The proxy plugin serves /frontend_latest, /static, /local" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("stored_config", "expected_status"),
     [

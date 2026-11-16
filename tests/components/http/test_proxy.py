@@ -13,6 +13,7 @@ from homeassistant.components.http.proxy import (
     CADDY_UPSTREAM,
     CaddyAdminClient,
     ProxyConfigError,
+    ProxyStaticRoute,
     ProxyUnavailableError,
     render_caddy_config,
 )
@@ -198,3 +199,59 @@ def test_render_public_certificate_by_sni() -> None:
     https = config["apps"]["http"]["servers"]["https"]
     assert len(https["tls_connection_policies"]) == 1
     assert len(config["apps"]["tls"]["certificates"]["load_pem"]) == 1
+
+
+def test_render_static_routes() -> None:
+    """Test static paths become file server routes ahead of the reverse proxy."""
+    config = render_caddy_config(
+        hosts=None,
+        http_port=80,
+        https_port=443,
+        certificate=None,
+        trusted_proxies=[],
+        static_routes=[
+            ProxyStaticRoute("/frontend_latest", "/run/frontend/frontend_latest")
+        ],
+        cors_origins=["https://cast.home-assistant.io"],
+        use_x_frame_options=True,
+    )
+    routes = config["apps"]["http"]["servers"]["http"]["routes"]
+    assert len(routes) == 3
+    assert routes[0]["match"] == [
+        {
+            "path": ["/frontend_latest/*"],
+            "header": {"Origin": ["https://cast.home-assistant.io"]},
+        }
+    ]
+    assert routes[0]["handle"][0]["response"]["set"]["Access-Control-Allow-Origin"] == [
+        "https://cast.home-assistant.io"
+    ]
+    assert routes[1]["match"] == [{"path": ["/frontend_latest/*"]}]
+    headers, rewrite, file_server = routes[1]["handle"]
+    assert headers["response"]["set"] == {
+        "Cache-Control": ["public, max-age=2678400"],
+        "Referrer-Policy": ["no-referrer"],
+        "X-Content-Type-Options": ["nosniff"],
+        "X-Frame-Options": ["SAMEORIGIN"],
+    }
+    assert rewrite == {"handler": "rewrite", "strip_path_prefix": "/frontend_latest"}
+    assert file_server == {
+        "handler": "file_server",
+        "root": "/run/frontend/frontend_latest",
+        "precompressed": {"br": {}, "gzip": {}},
+        "precompressed_order": ["br", "gzip"],
+    }
+    assert routes[2]["handle"][0]["handler"] == "reverse_proxy"
+
+    config = render_caddy_config(
+        hosts=None,
+        http_port=80,
+        https_port=443,
+        certificate=None,
+        trusted_proxies=[],
+        static_routes=[ProxyStaticRoute("/static", "/run/frontend/static")],
+        use_x_frame_options=False,
+    )
+    routes = config["apps"]["http"]["servers"]["http"]["routes"]
+    assert len(routes) == 2
+    assert "X-Frame-Options" not in routes[0]["handle"][0]["response"]["set"]

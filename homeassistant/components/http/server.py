@@ -70,6 +70,7 @@ from .proxy import (
     PROXY_RETRY_INTERVAL,
     CaddyAdminClient,
     ProxyPaths,
+    ProxyStaticRoute,
     ProxyUnavailableError,
     render_caddy_config,
 )
@@ -238,6 +239,30 @@ async def async_verify_can_bind(hass: HomeAssistant, conf: ConfData) -> None:
         await server.stop()
 
 
+def _proxy_static_routes(
+    configs: Collection[StaticPathConfig], shared: list[Path]
+) -> list[ProxyStaticRoute]:
+    """Map static directories to the proxy's view of the shared directories.
+
+    Both sides are resolved, since the shared path may be a symlink to the
+    package in the image. Blocking, run in executor.
+    """
+    resolved = [(root, root.resolve()) for root in shared]
+    routes: list[ProxyStaticRoute] = []
+    for config in configs:
+        path = Path(config.path).resolve()
+        for root, real_root in resolved:
+            if path.is_relative_to(real_root):
+                routes.append(
+                    ProxyStaticRoute(
+                        url_path=config.url_path,
+                        root=str(root / path.relative_to(real_root)),
+                    )
+                )
+                break
+    return routes
+
+
 class HomeAssistantRequest(web.Request):
     """Home Assistant request object."""
 
@@ -336,6 +361,10 @@ class HomeAssistantHTTP:
         self.proxy_active = False
         # Runs while serving directly, to hand the ports back to the proxy
         self._proxy_retry: asyncio.Task[None] | None = None
+        # Static paths the proxy serves from its own mount of the frontend
+        self._proxy_static: list[ProxyStaticRoute] = []
+        self._cors_origins: list[str] = []
+        self._use_x_frame_options = True
         self.runner: web.AppRunner | None = None
         self.supervisor_site: HomeAssistantUnixSite | None = None
         self.proxy_site: HomeAssistantUnixSite | None = None
@@ -387,6 +416,9 @@ class HomeAssistantHTTP:
             certificate=self.certificate,
             public_certificate=self.public_certificate,
             trusted_proxies=[str(proxy) for proxy in self.trusted_proxies],
+            static_routes=self._proxy_static,
+            cors_origins=self._cors_origins,
+            use_x_frame_options=self._use_x_frame_options,
         )
 
     async def async_apply_certificate(self, certificate: CertificatePair) -> bool:
@@ -541,6 +573,8 @@ class HomeAssistantHTTP:
         use_x_frame_options: bool,
     ) -> None:
         """Initialize the server."""
+        self._cors_origins = cors_origins
+        self._use_x_frame_options = use_x_frame_options
         self.app[KEY_HASS] = self.hass
         self.app["hass"] = self.hass  # For backwards compatibility
 
@@ -622,11 +656,45 @@ class HomeAssistantHTTP:
     async def async_register_static_paths(
         self, configs: Collection[StaticPathConfig]
     ) -> None:
-        """Register a folder or file to serve as a static path."""
+        """Register a folder or file to serve as a static path.
+
+        Cacheable directories inside one the proxy plugin has mounted are
+        also served by its file server and then never reach Core. Core
+        registers them regardless, for the fallback to direct serving.
+        """
         resources = await self.hass.async_add_executor_job(
             self._make_static_resources, configs
         )
         self._async_register_static_paths(configs, resources)
+        if self.proxy is None or not self.proxy.shared:
+            return
+        routes = await self.hass.async_add_executor_job(
+            _proxy_static_routes,
+            [
+                config
+                for config in configs
+                if config.cache_headers and resources[config.url_path] is not None
+            ],
+            self.proxy.shared,
+        )
+        if not routes:
+            return
+        self._proxy_static.extend(routes)
+        if not self.proxy_active:
+            return
+        try:
+            await self._async_reload_proxy()
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "The proxy plugin did not take the static paths, serving them"
+                " from Core: %s",
+                err,
+            )
+            del self._proxy_static[-len(routes) :]
+            return
+        _LOGGER.info(
+            "The proxy plugin serves %s", ", ".join(route.url_path for route in routes)
+        )
 
     @callback
     def _async_register_static_paths(
