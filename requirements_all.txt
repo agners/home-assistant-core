@@ -126,6 +126,9 @@ WSDiscovery==2.1.2
 # homeassistant.components.accuweather
 accuweather==5.1.0
 
+# homeassistant.components.http
+acme==5.7.0
+
 # homeassistant.components.actron_air
 actron-neo-api==0.5.16
 
@@ -1494,6 +1497,9 @@ jaraco.abode==6.4.0
 
 # homeassistant.components.jellyfin
 jellyfin-apiclient-python==1.19.0
+
+# homeassistant.components.http
+josepy==2.2.0
 
 # homeassistant.components.command_line
 # homeassistant.components.rest

@@ -53,6 +53,9 @@ from homeassistant.components.http.proxy import (
     ProxyConfigError,
     ProxyUnavailableError,
 )
+from homeassistant.components.http.public_certificate import (
+    async_get_public_certificate_manager,
+)
 from homeassistant.components.http.repairs import (
     SSLProfileOutdatedFlow,
     async_create_fix_flow,
@@ -2473,7 +2476,7 @@ async def test_websocket_http_config(
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
         "proxy": {"available": False, "active": False},
-        "certificates": {"uploaded": None, "generated": None},
+        "certificates": {"uploaded": None, "generated": None, "public": None},
     }
 
     new_config = {
@@ -2520,7 +2523,7 @@ async def test_websocket_http_config(
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
         "proxy": {"available": False, "active": False},
-        "certificates": {"uploaded": None, "generated": None},
+        "certificates": {"uploaded": None, "generated": None, "public": None},
     }
 
     # Promote: pending becomes stable, pending is cleared.
@@ -2550,7 +2553,7 @@ async def test_websocket_http_config(
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
         "proxy": {"available": False, "active": False},
-        "certificates": {"uploaded": None, "generated": None},
+        "certificates": {"uploaded": None, "generated": None, "public": None},
     }
 
     # Promoting again with no pending is rejected.
@@ -3029,7 +3032,7 @@ async def test_pending_config_auto_reverts_to_stable(
         "active_config_type": "pending",
         "default": _DEFAULT_CONFIG,
         "proxy": {"available": False, "active": False},
-        "certificates": {"uploaded": None, "generated": None},
+        "certificates": {"uploaded": None, "generated": None, "public": None},
     }
 
     # After the delay elapses without a promotion, pending is marked reverted
@@ -3637,7 +3640,7 @@ async def test_pending_config_promote_cancels_revert(
         "active_config_type": "stable",
         "default": _DEFAULT_CONFIG,
         "proxy": {"available": False, "active": False},
-        "certificates": {"uploaded": None, "generated": None},
+        "certificates": {"uploaded": None, "generated": None, "public": None},
     }
 
     # The cancelled revert must not fire after the delay.
@@ -3858,6 +3861,87 @@ async def test_proxy_mode_regenerate_applies_live(
     assert not response["success"]
     assert response["error"]["code"] == "apply_failed"
     assert hass.http.certificate["certificate"] == pushed["load_pem"][0]["certificate"]
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_mode_public_certificate(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Test the public certificate is pushed live next to the local one."""
+    store = await async_get_certificate_store(hass)
+    await store.async_generate(["homeassistant.local"])
+    http_store = await async_get_and_load_store(hass)
+    await http_store.async_set_pending(
+        HTTP_STORAGE_SCHEMA({"certificate": "generated", "https_port": 8443})
+    )
+    # Any valid PEM does for the status call that describes it
+    public = {
+        "certificate": store.generated["certificate"],
+        "key": store.generated["key"],
+        "name": "*.id.ha.example",
+    }
+    manager = await async_get_public_certificate_manager(hass)
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load"
+        ) as mock_load,
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site"),
+        patch.object(manager, "_async_issue") as mock_issue,
+        patch.object(manager, "async_probe", return_value="ok"),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await async_setup_component(hass, "websocket_api", {})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        assert (
+            "tls_connection_policies"
+            in (mock_load.call_args.args[0]["apps"]["http"]["servers"]["https"])
+        )
+        assert (
+            len(mock_load.call_args.args[0]["apps"]["tls"]["certificates"]["load_pem"])
+            == 1
+        )
+
+        async def issue() -> None:
+            manager._data["certificate"] = public
+
+        mock_issue.side_effect = issue
+        ws_client = await hass_ws_client(hass)
+        await ws_client.send_json_auto_id(
+            {"type": "http/public_certificate/enable", "zone": "ha.example"}
+        )
+        response = await ws_client.receive_json()
+
+        assert response["success"]
+        assert mock_load.await_count == 2
+        pushed = mock_load.call_args.args[0]["apps"]
+        assert pushed["http"]["servers"]["https"]["tls_connection_policies"][0] == {
+            "match": {"sni": ["*.id.ha.example"]},
+            "certificate_selection": {"any_tag": ["public"]},
+        }
+        assert [c["tags"] for c in pushed["tls"]["certificates"]["load_pem"]] == [
+            ["public"],
+            ["core"],
+        ]
+        assert hass.http.public_certificate == public
+
+        # A rejected config keeps the previous certificate; opting out drops it
+        mock_load.side_effect = ProxyConfigError("rejected")
+        await ws_client.send_json_auto_id({"type": "http/public_certificate/disable"})
+        response = await ws_client.receive_json()
+        assert response["success"]
+        assert hass.http.public_certificate == public
+        assert manager.certificate is None
+
+        mock_load.side_effect = None
+        await ws_client.send_json_auto_id({"type": "http/public_certificate/disable"})
+        await ws_client.receive_json()
+        assert hass.http.public_certificate is None
+        pushed = mock_load.call_args.args[0]["apps"]
+        assert pushed["http"]["servers"]["https"]["tls_connection_policies"] == [
+            {"certificate_selection": {"any_tag": ["core"]}}
+        ]
 
 
 @pytest.mark.parametrize(

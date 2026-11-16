@@ -3,6 +3,7 @@
 -c homeassistant/package_constraints.txt
 
 # Home Assistant Core
+acme==5.7.0
 aiodns==4.0.4
 aiogithubapi==26.0.0
 aiohttp-asyncmdnsresolver==0.2.0
@@ -33,6 +34,7 @@ httpx2==2.14.0
 ifaddr==0.2.0
 infrared-protocols==10.6.0
 Jinja2==3.1.6
+josepy==2.2.0
 lru-dict==1.4.1
 mutagen==1.48.1
 orjson==3.13.0

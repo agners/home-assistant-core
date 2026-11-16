@@ -73,6 +73,7 @@ from .proxy import (
     ProxyUnavailableError,
     render_caddy_config,
 )
+from .public_certificate import PublicCertificate
 from .request_context import setup_request_context
 from .security_filter import setup_security_filter
 from .static import CACHE_HEADERS, CachingStaticResource
@@ -121,12 +122,14 @@ def make_server(
     supervisor_unix_socket_path: Path | None = None,
     proxy: ProxyPaths | None = None,
     certificate: CertificatePair | None = None,
+    public_certificate: PublicCertificate | None = None,
 ) -> HomeAssistantHTTP:
     """Create a server instance for the given config.
 
     ``certificate`` is the resolved PEM pair for the uploaded and generated
     certificate sources (and for file paths when fronted by the proxy); the
-    file paths in ``conf`` are used directly otherwise.
+    file paths in ``conf`` are used directly otherwise. ``public_certificate``
+    is served by the proxy for its own name next to ``certificate``.
     """
     return HomeAssistantHTTP(
         hass,
@@ -134,6 +137,7 @@ def make_server(
         server_port=conf[CONF_SERVER_PORT],
         https_port=conf.get(CONF_HTTPS_PORT, DEFAULT_HTTPS_PORT),
         certificate=certificate,
+        public_certificate=public_certificate,
         certificate_source=conf.get(CONF_CERTIFICATE, CertificateSource.FILES),
         proxy=proxy,
         ssl_certificate=conf.get(CONF_SSL_CERTIFICATE),
@@ -300,6 +304,7 @@ class HomeAssistantHTTP:
         certificate: CertificatePair | None = None,
         certificate_source: CertificateSource = CertificateSource.FILES,
         proxy: ProxyPaths | None = None,
+        public_certificate: PublicCertificate | None = None,
     ) -> None:
         """Initialize the HTTP Home Assistant server."""
         self.app = HomeAssistantApplication(
@@ -322,6 +327,8 @@ class HomeAssistantHTTP:
         self.https_port = https_port
         self.certificate = certificate
         self.certificate_source = certificate_source
+        # Only the proxy serves it; a direct TLS listener has one certificate
+        self.public_certificate = public_certificate
         self.proxy = proxy
         # Set once the proxy plugin accepted the config; the server then
         # listens on the proxy socket only. Stays False when the plugin is
@@ -378,6 +385,7 @@ class HomeAssistantHTTP:
             http_port=self.server_port,
             https_port=self.https_port,
             certificate=self.certificate,
+            public_certificate=self.public_certificate,
             trusted_proxies=[str(proxy) for proxy in self.trusted_proxies],
         )
 
@@ -391,18 +399,42 @@ class HomeAssistantHTTP:
         """
         if not self.proxy_active:
             return False
-        if TYPE_CHECKING:
-            assert self.proxy is not None
         previous = self.certificate
         self.certificate = certificate
         try:
-            await CaddyAdminClient(self.proxy.admin_socket).async_load(
-                self._render_proxy_config()
-            )
+            await self._async_reload_proxy()
         except HomeAssistantError:
             self.certificate = previous
             raise
         return True
+
+    async def async_apply_public_certificate(
+        self, certificate: PublicCertificate | None
+    ) -> bool:
+        """Serve ``certificate`` for its name, or stop doing so with ``None``.
+
+        Returns whether the running proxy took it; serving directly it is not
+        used at all. Raises ``HomeAssistantError`` when the proxy refuses it,
+        leaving the previous one in use.
+        """
+        if not self.proxy_active:
+            self.public_certificate = certificate
+            return False
+        previous = self.public_certificate
+        self.public_certificate = certificate
+        try:
+            await self._async_reload_proxy()
+        except HomeAssistantError:
+            self.public_certificate = previous
+            raise
+        return True
+
+    async def _async_reload_proxy(self) -> None:
+        if TYPE_CHECKING:
+            assert self.proxy is not None
+        await CaddyAdminClient(self.proxy.admin_socket).async_load(
+            self._render_proxy_config()
+        )
 
     async def _async_push_proxy_config(self) -> None:
         """Push the listener config to the proxy plugin, retrying while it starts."""
@@ -754,7 +786,7 @@ class HomeAssistantHTTP:
         _LOGGER.info(
             "Now serving through the proxy plugin on port %d (HTTPS on port %s)",
             self.server_port,
-            self.https_port if self.certificate is not None else "-",
+            self.https_port if self._render_proxy_config()["apps"].get("tls") else "-",
         )
 
     async def async_start_supervisor_unix_socket(self) -> None:

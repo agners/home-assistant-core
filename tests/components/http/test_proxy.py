@@ -159,3 +159,41 @@ async def test_client_unavailable(admin_socket: Path) -> None:
         await client.async_load({"admin": {}})
     with pytest.raises(ProxyUnavailableError):
         await client.async_get_config()
+
+
+def test_render_public_certificate_by_sni() -> None:
+    """Test the public certificate is picked by its name, the local one otherwise."""
+    public = {"certificate": "PUB", "key": "PUBKEY", "name": "*.id.ha.example"}
+    config = render_caddy_config(
+        hosts=None,
+        http_port=80,
+        https_port=443,
+        certificate=CERTIFICATE,
+        public_certificate=public,
+        trusted_proxies=[],
+    )
+    https = config["apps"]["http"]["servers"]["https"]
+    assert https["tls_connection_policies"] == [
+        {
+            "match": {"sni": ["*.id.ha.example"]},
+            "certificate_selection": {"any_tag": ["public"]},
+        },
+        {"certificate_selection": {"any_tag": ["core"]}},
+    ]
+    assert config["apps"]["tls"]["certificates"]["load_pem"] == [
+        {"certificate": "PUB", "key": "PUBKEY", "tags": ["public"]},
+        {"certificate": "CERT", "key": "KEY", "tags": ["core"]},
+    ]
+
+    # The public certificate alone still gives an HTTPS server
+    config = render_caddy_config(
+        hosts=None,
+        http_port=80,
+        https_port=443,
+        certificate=None,
+        public_certificate=public,
+        trusted_proxies=[],
+    )
+    https = config["apps"]["http"]["servers"]["https"]
+    assert len(https["tls_connection_policies"]) == 1
+    assert len(config["apps"]["tls"]["certificates"]["load_pem"]) == 1

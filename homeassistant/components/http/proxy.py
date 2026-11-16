@@ -10,6 +10,7 @@ import aiohttp
 from homeassistant.exceptions import HomeAssistantError
 
 from .certificates import CertificatePair
+from .public_certificate import PublicCertificate
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,9 +18,10 @@ _LOGGER = logging.getLogger(__name__)
 # it by Supervisor. Core's view of the same sockets comes from its environment.
 CADDY_ADMIN_LISTEN: Final = "unix//run/supervisor/proxy/proxy.sock|0600"
 CADDY_UPSTREAM: Final = "unix//run/supervisor/core/plugins/proxy/core.sock"
-# Selects the one certificate Core pushes regardless of the requested name,
-# so HTTPS by IP address works without SNI tricks.
+# The local certificate is served regardless of the requested name, so HTTPS
+# by IP address works; the public one only for its own name.
 CERTIFICATE_TAG: Final = "core"
+PUBLIC_CERTIFICATE_TAG: Final = "public"
 
 LOAD_ATTEMPTS: Final = 5
 LOAD_RETRY_DELAY: Final = 2.0
@@ -66,12 +68,16 @@ def render_caddy_config(
     http_port: int,
     https_port: int,
     certificate: CertificatePair | None,
+    public_certificate: PublicCertificate | None = None,
     trusted_proxies: list[str],
 ) -> dict[str, Any]:
     """Render the full Caddy JSON config for the proxy plugin.
 
     The admin listener must be part of every pushed config, otherwise Caddy
     falls back to its default TCP admin endpoint and Core loses control.
+
+    Both certificates share the HTTPS listener: the public one is picked by
+    SNI for its name, the local one for everything else.
     """
     route = {
         "handle": [
@@ -97,23 +103,36 @@ def render_caddy_config(
 
     servers = {"http": server(http_port)}
     apps: dict[str, Any] = {"http": {"servers": servers}}
-    if certificate is not None:
-        https = server(https_port)
-        https["tls_connection_policies"] = [
-            {"certificate_selection": {"any_tag": [CERTIFICATE_TAG]}}
-        ]
-        servers["https"] = https
-        apps["tls"] = {
-            "certificates": {
-                "load_pem": [
-                    {
-                        "certificate": certificate["certificate"],
-                        "key": certificate["key"],
-                        "tags": [CERTIFICATE_TAG],
-                    }
-                ]
+    policies: list[dict[str, Any]] = []
+    load_pem: list[dict[str, Any]] = []
+    if public_certificate is not None:
+        policies.append(
+            {
+                "match": {"sni": [public_certificate["name"]]},
+                "certificate_selection": {"any_tag": [PUBLIC_CERTIFICATE_TAG]},
             }
-        }
+        )
+        load_pem.append(
+            {
+                "certificate": public_certificate["certificate"],
+                "key": public_certificate["key"],
+                "tags": [PUBLIC_CERTIFICATE_TAG],
+            }
+        )
+    if certificate is not None:
+        policies.append({"certificate_selection": {"any_tag": [CERTIFICATE_TAG]}})
+        load_pem.append(
+            {
+                "certificate": certificate["certificate"],
+                "key": certificate["key"],
+                "tags": [CERTIFICATE_TAG],
+            }
+        )
+    if load_pem:
+        https = server(https_port)
+        https["tls_connection_policies"] = policies
+        servers["https"] = https
+        apps["tls"] = {"certificates": {"load_pem": load_pem}}
     return {
         "admin": {"listen": CADDY_ADMIN_LISTEN},
         "logging": {

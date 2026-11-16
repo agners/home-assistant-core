@@ -26,6 +26,11 @@ from .const import (
     CONF_USE_X_FORWARDED_FOR,
     CertificateSource,
 )
+from .public_certificate import (
+    PublicCertificateSettings,
+    async_get_public_certificate_manager,
+    default_settings,
+)
 from .server import DEFAULT_BIND, async_verify_can_bind, async_verify_hosts_distinct
 
 ERR_BIND_FAILED: Final = "bind_failed"
@@ -33,6 +38,7 @@ ERR_NOT_RUNNING: Final = "not_running"
 ERR_INVALID_CERTIFICATE: Final = "invalid_certificate"
 ERR_CERTIFICATE_IN_USE: Final = "certificate_in_use"
 ERR_APPLY_FAILED: Final = "apply_failed"
+ERR_ISSUE_FAILED: Final = "issue_failed"
 
 STATUS_APPLIED: Final = "applied"
 STATUS_RESTART_REQUIRED: Final = "restart_required"
@@ -42,6 +48,9 @@ ATTR_CERTIFICATE: Final = "certificate"
 ATTR_KEY: Final = "key"
 ATTR_SOURCE: Final = "source"
 ATTR_SUBJECTS: Final = "subjects"
+ATTR_ZONE: Final = "zone"
+ATTR_API_URL: Final = "api_url"
+ATTR_DIRECTORY_URL: Final = "directory_url"
 
 
 def _validate_trusted_proxies(config: ConfData) -> ConfData:
@@ -89,6 +98,9 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_generate_certificate)
     websocket_api.async_register_command(hass, websocket_delete_certificate)
     websocket_api.async_register_command(hass, websocket_get_ca_certificate)
+    websocket_api.async_register_command(hass, websocket_public_certificate_status)
+    websocket_api.async_register_command(hass, websocket_public_certificate_enable)
+    websocket_api.async_register_command(hass, websocket_public_certificate_disable)
 
 
 @websocket_api.require_admin
@@ -111,10 +123,11 @@ async def websocket_get_config(
     ``default`` is the built-in default config.
     ``proxy`` tells whether the Supervisor proxy plugin is available and
     whether the server is currently serving through it.
-    ``certificates`` describes the uploaded and generated certificates.
+    ``certificates`` describes the uploaded, generated and public certificates.
     """
     store = await async_get_and_load_store(hass)
     certificates = await async_get_certificate_store(hass)
+    public = await async_get_public_certificate_manager(hass)
     http = hass.http
     connection.send_result(
         msg["id"],
@@ -131,6 +144,7 @@ async def websocket_get_config(
             "certificates": {
                 "uploaded": await certificates.async_info(CertificateSource.UPLOADED),
                 "generated": await certificates.async_info(CertificateSource.GENERATED),
+                "public": await public.async_info(),
             },
         },
     )
@@ -391,3 +405,89 @@ async def websocket_get_ca_certificate(
         )
         return
     connection.send_result(msg["id"], {ATTR_CERTIFICATE: generated["ca_certificate"]})
+
+
+async def _async_public_certificate_status(hass: HomeAssistant) -> dict[str, Any]:
+    """Describe the public certificate, its name and whether the name works here."""
+    manager = await async_get_public_certificate_manager(hass)
+    local_ip = hass.config.api.local_ip if hass.config.api is not None else None
+    return {
+        "enabled": manager.enabled,
+        "settings": manager.settings,
+        "instance_id": manager.instance_id,
+        "certificate": await manager.async_info(),
+        "url": manager.url(local_ip) if local_ip else None,
+        "probe": await manager.async_probe(local_ip) if local_ip else None,
+        "last_error": manager.last_error,
+    }
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {probatio.Required("type"): "http/public_certificate/status"}
+)
+@websocket_api.async_response
+async def websocket_public_certificate_status(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the state of the public certificate.
+
+    ``url`` is the HTTPS URL of the instance under its public name and
+    ``probe`` tells whether that name resolves on this network.
+    """
+    connection.send_result(msg["id"], await _async_public_certificate_status(hass))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "http/public_certificate/enable",
+        probatio.Optional(ATTR_ZONE): str,
+        probatio.Optional(ATTR_API_URL): str,
+        probatio.Optional(ATTR_DIRECTORY_URL): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_public_certificate_enable(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Opt in to a public certificate and get one.
+
+    The instance ID becomes public through the certificate logs, and each
+    lookup of the name tells the zone the instance's address; this is the
+    user's decision. Unset settings take the defaults of the default zone.
+    """
+    defaults = default_settings()
+    zone = msg.get(ATTR_ZONE, defaults["zone"])
+    settings = PublicCertificateSettings(
+        zone=zone,
+        api_url=msg.get(ATTR_API_URL, f"https://api.{zone}"),
+        directory_url=msg.get(ATTR_DIRECTORY_URL, defaults["directory_url"]),
+    )
+    manager = await async_get_public_certificate_manager(hass)
+    try:
+        await manager.async_enable(settings)
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], ERR_ISSUE_FAILED, str(err))
+        return
+    connection.send_result(msg["id"], await _async_public_certificate_status(hass))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {probatio.Required("type"): "http/public_certificate/disable"}
+)
+@websocket_api.async_response
+async def websocket_public_certificate_disable(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Opt out: stop serving the public certificate and forget it."""
+    manager = await async_get_public_certificate_manager(hass)
+    await manager.async_disable()
+    connection.send_result(msg["id"])

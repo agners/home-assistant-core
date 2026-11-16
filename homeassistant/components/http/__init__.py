@@ -59,6 +59,7 @@ from .const import (
 )
 from .decorators import require_admin
 from .proxy import ProxyPaths
+from .public_certificate import async_get_public_certificate_manager
 from .server import (
     DEFAULT_BIND,
     HassioHTTPConfigView,
@@ -217,6 +218,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     proxy = _proxy_paths_from_env()
     certificate_store = await async_get_certificate_store(hass)
+    public_certificates = await async_get_public_certificate_manager(hass)
     trial_reverted = False
     while True:
         try:
@@ -224,7 +226,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 conf, read_files=proxy is not None
             )
             server = make_server(
-                hass, conf, supervisor_unix_socket_path, proxy, certificate
+                hass,
+                conf,
+                supervisor_unix_socket_path,
+                proxy,
+                certificate,
+                public_certificates.certificate,
             )
             await server.async_bind()
         except (HomeAssistantError, OSError) as err:
@@ -247,6 +254,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     async def stop_server(event: Event) -> None:
         """Stop the server."""
+        public_certificates.async_stop()
         await server.stop()
 
     # Register the stop listener right away, not only once serving starts:
@@ -289,6 +297,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         async_when_setup_or_start(hass, "hassio", start_supervisor_unix_socket)
 
     hass.http = server
+    # Issuance and renewal run in the background, never blocking startup
+    public_certificates.async_start()
 
     local_ip = await source_ip_task
 
