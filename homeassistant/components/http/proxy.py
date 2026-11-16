@@ -22,6 +22,8 @@ CADDY_UPSTREAM: Final = "unix//run/supervisor/core/plugins/proxy/core.sock"
 # by IP address works; the public one only for its own name.
 CERTIFICATE_TAG: Final = "core"
 PUBLIC_CERTIFICATE_TAG: Final = "public"
+# How long open streams outlive the config they were accepted under
+STREAM_CLOSE_DELAY: Final = "24h"
 
 LOAD_ATTEMPTS: Final = 5
 LOAD_RETRY_DELAY: Final = 2.0
@@ -84,6 +86,9 @@ def render_caddy_config(
             {
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": CADDY_UPSTREAM}],
+                # A config reload (new certificate, handover) must not cut the
+                # frontend's websockets; Caddy closes them at once by default
+                "stream_close_delay": STREAM_CLOSE_DELAY,
             }
         ]
     }

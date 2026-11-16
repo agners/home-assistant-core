@@ -63,6 +63,7 @@ def test_render_plain_http() -> None:
     assert servers["http"]["routes"][0]["handle"][0] == {
         "handler": "reverse_proxy",
         "upstreams": [{"dial": CADDY_UPSTREAM}],
+        "stream_close_delay": "24h",
     }
     assert "trusted_proxies" not in servers["http"]
     assert "tls" not in config["apps"]
