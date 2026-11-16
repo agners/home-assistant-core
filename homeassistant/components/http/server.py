@@ -67,6 +67,7 @@ from .headers import setup_headers
 from .proxy import (
     LOAD_ATTEMPTS,
     LOAD_RETRY_DELAY,
+    PROXY_RETRY_INTERVAL,
     CaddyAdminClient,
     ProxyPaths,
     ProxyUnavailableError,
@@ -326,6 +327,8 @@ class HomeAssistantHTTP:
         # listens on the proxy socket only. Stays False when the plugin is
         # unreachable and Core serves directly instead.
         self.proxy_active = False
+        # Runs while serving directly, to hand the ports back to the proxy
+        self._proxy_retry: asyncio.Task[None] | None = None
         self.runner: web.AppRunner | None = None
         self.supervisor_site: HomeAssistantUnixSite | None = None
         self.proxy_site: HomeAssistantUnixSite | None = None
@@ -422,6 +425,51 @@ class HomeAssistantHTTP:
             "The proxy plugin is not reachable, serving directly instead: %s",
             last_error,
         )
+
+    async def _async_retry_proxy(self) -> None:
+        """Hand the ports back to the proxy plugin once it is reachable again."""
+        if TYPE_CHECKING:
+            assert self.proxy is not None
+        client = CaddyAdminClient(self.proxy.admin_socket)
+        while not self.proxy_active:
+            await asyncio.sleep(PROXY_RETRY_INTERVAL)
+            try:
+                await client.async_get_config()
+            except ProxyUnavailableError:
+                continue
+            await self._async_hand_over_to_proxy(client)
+
+    async def _async_hand_over_to_proxy(self, client: CaddyAdminClient) -> None:
+        """Release the direct listener and push the config to the proxy.
+
+        The proxy binds the same ports, so the listener is closed before the
+        push; open connections are left to finish. If the proxy still
+        refuses, the listener is bound again.
+        """
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        try:
+            await client.async_load(self._render_proxy_config())
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "The proxy plugin is back but did not accept the configuration,"
+                " still serving directly: %s",
+                err,
+            )
+            try:
+                self._server = await self._async_create_server()
+                await self._server.start_serving()
+            except OSError as bind_err:
+                # Nothing serves now; the loop keeps trying the proxy
+                _LOGGER.error(
+                    "Cannot bind port %d again: %s", self.server_port, bind_err
+                )
+            return
+        self._server = None
+        self.proxy_active = True
+        _LOGGER.info("The proxy plugin is reachable again, handing the ports over")
+        await self._async_start_proxy_site()
 
     async def _async_create_server(self) -> asyncio.Server:
         """Create the (not yet serving) HTTP server, binding its sockets."""
@@ -757,6 +805,10 @@ class HomeAssistantHTTP:
             assert self._server is not None
             await self._server.start_serving()
             _LOGGER.info("Now listening on port %d", self.server_port)
+            if self.proxy is not None:
+                self._proxy_retry = self.hass.async_create_background_task(
+                    self._async_retry_proxy(), "http proxy retry"
+                )
 
         if self._port_transition:
             # Defer to onboarding setup so async_is_onboarded and
@@ -841,6 +893,9 @@ class HomeAssistantHTTP:
     async def stop(self) -> None:
         """Stop the aiohttp server."""
         await self._async_stop_legacy_redirect()
+        if self._proxy_retry is not None:
+            self._proxy_retry.cancel()
+            self._proxy_retry = None
         if self.proxy_site is not None:
             await self.proxy_site.stop()
             if TYPE_CHECKING:

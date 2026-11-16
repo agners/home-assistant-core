@@ -23,6 +23,8 @@ CERTIFICATE_TAG: Final = "core"
 
 LOAD_ATTEMPTS: Final = 5
 LOAD_RETRY_DELAY: Final = 2.0
+# While Core serves directly, how often it checks for the proxy to come back
+PROXY_RETRY_INTERVAL: Final = 30.0
 REQUEST_TIMEOUT: Final = aiohttp.ClientTimeout(total=10)
 
 

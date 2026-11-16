@@ -3922,6 +3922,103 @@ async def test_proxy_unavailable_serves_directly(
 
 
 @pytest.mark.usefixtures("proxy_env")
+async def test_proxy_returns_while_serving_directly(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test Core hands its ports to the proxy plugin once it is reachable again."""
+    proxy_back = asyncio.Event()
+
+    async def get_config() -> dict[str, Any]:
+        if not proxy_back.is_set():
+            raise ProxyUnavailableError("down")
+        return {}
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load",
+            side_effect=[ProxyUnavailableError("down")] * LOAD_ATTEMPTS + [None],
+        ) as mock_load,
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_get_config",
+            side_effect=get_config,
+        ),
+        patch("homeassistant.components.http.server.LOAD_RETRY_DELAY", 0),
+        patch("homeassistant.components.http.server.PROXY_RETRY_INTERVAL", 0),
+        patch.object(http.HomeAssistantHTTP, "_async_start_proxy_site") as mock_site,
+    ):
+        assert await async_setup_component(hass, DOMAIN, {"http": {}})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        assert hass.http.proxy_active is False
+        assert hass.http._server is not None
+        retry = hass.http._proxy_retry
+        assert retry is not None
+
+        proxy_back.set()
+        await asyncio.wait_for(retry, 1)
+
+    assert mock_load.await_count == LOAD_ATTEMPTS + 1
+    assert hass.http.proxy_active is True
+    assert hass.http._server is None
+    mock_site.assert_awaited_once()
+    assert "handing the ports over" in caplog.text
+
+
+@pytest.mark.usefixtures("proxy_env")
+async def test_proxy_returns_but_rejects_config(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test Core binds its port again when the returned proxy rejects the config."""
+    proxy_back = asyncio.Event()
+    rejected = asyncio.Event()
+
+    async def get_config() -> dict[str, Any]:
+        if not proxy_back.is_set():
+            raise ProxyUnavailableError("down")
+        return {}
+
+    async def load(config: dict[str, Any]) -> None:
+        if not proxy_back.is_set():
+            raise ProxyUnavailableError("down")
+        # Reject once, then be unreachable again so the loop does not retry
+        proxy_back.clear()
+        rejected.set()
+        raise ProxyConfigError("port in use")
+
+    with (
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_load",
+            side_effect=load,
+        ),
+        patch(
+            "homeassistant.components.http.server.CaddyAdminClient.async_get_config",
+            side_effect=get_config,
+        ),
+        patch("homeassistant.components.http.server.LOAD_RETRY_DELAY", 0),
+        patch("homeassistant.components.http.server.PROXY_RETRY_INTERVAL", 0),
+    ):
+        assert await async_setup_component(hass, DOMAIN, {"http": {}})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        first_server = hass.http._server
+        assert first_server is not None
+
+        proxy_back.set()
+        await asyncio.wait_for(rejected.wait(), 1)
+        # Let the handover finish rebinding before stopping the retry loop
+        for _ in range(10):
+            await asyncio.sleep(0)
+        retry = hass.http._proxy_retry
+        assert retry is not None
+        retry.cancel()
+
+    assert hass.http.proxy_active is False
+    assert hass.http._server is not None
+    assert hass.http._server is not first_server
+    assert "did not accept the configuration" in caplog.text
+
+
+@pytest.mark.usefixtures("proxy_env")
 async def test_proxy_rejected_config_falls_back_to_stable(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
